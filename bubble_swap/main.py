@@ -9,9 +9,27 @@ from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, execute, 
 from qiskit.circuit import Clbit, Qubit
 from qiskit.providers.aer.noise import NoiseModel
 
+# backbone code for playing around with "bubble swap" - a two-qubit operation that acts as
+# a swap gate if one of the two qubits is initially in a zero state, with the possibility
+# to perform postselection after the swap, by using the information that without noise
+# the state that swapped with |0> should now be IN |0>. The advantage over regular swap
+# is fewer CNOTs and the additional reduction of errors from postselection.This could be
+# used for novel circuit compilers, but my (limited) numerics suggest it's not so good.
+
 class GridCircuit:
-    def __init__(self, provider, x = None, y = None, coupling_map = None, no_qubits = None, no_bits = 2, noise_model = None, max_no_swaps = 10, mit_matrices = None):
+    
+    # defines a circuit with grid connectivity (unless specified otherwise),
+    # 2D definition of qubits (qubit defined by x,y indices not just a single index),
+    # wrappers for gates to account for this (qiskit gates take in single index),
+    # and fully integrated bubble swap 'gate' with postselection capabilities
+    # (fully integrated in the sense that the user never has to directly deal with
+    # the mid-circuit-measurements and postselect based on their outcome, it is done
+    # by the code as long as the user passes postselect = True)
+    # (also mid-circuit-measurement error mitigation but afaik it's fundamentally wrong)
+    
+    def __init__(self, provider, x = None, y = None, coupling_map = None, no_qubits = None, no_bits = 2, noise_model = 0, max_no_swaps = 10, mit_matrices = None):
         
+        # (x,y) - size of the grid
         # either (x,y) or no_qubits should be specified; if neither, do 5x5 grid, if both, overwrite no_qubits
         if x == None and y == None and no_qubits == None:
             x = 5
@@ -21,21 +39,30 @@ class GridCircuit:
             
         self.x = x
         self.y = y
-        self.no_bits = no_bits # data bits (the idea is the user never has to deal with postselection so we give the name
-        # no_bits to the number of data bits, even though the total number of bits in the circuit is no_bits + max_no_swaps)
+        
         if no_qubits == None:
             self.no_qubits = x * y
             
         if coupling_map == None:
             self.coupling_map = self.grid_coupling_map(self.x, self.y)
         
-        if noise_model == None:
+        # by default we take a noise model from ibm perth - we need one
+        # to compare bubble swap to a regular swap in terms of fidelity
+        if noise_model == 0:
             self.noise_model = NoiseModel.from_backend(provider.get_backend('ibm_perth'))
         else:
             self.noise_model = noise_model
         
+        # size of classical register which will contain bits measured into when bubble swapping
         self.max_no_swaps = max_no_swaps
+        
+        self.no_bits = no_bits # data bits (the idea is the user never has to deal with postselection
+        #so we give the name no_bits to the number of data bits, even though the total number of bits
+        # in the circuit is no_bits + max_no_swaps)
+        
         self.total_no_bits = self.no_bits + self.max_no_swaps
+        
+        # initialising registers for circuit
         self.qreg = QuantumRegister(self.no_qubits)
         self.data_clreg = ClassicalRegister(self.no_bits)
         self.post_clreg = ClassicalRegister(self.max_no_swaps)
@@ -43,15 +70,18 @@ class GridCircuit:
         self.circuit = QuantumCircuit(self.qreg, self.data_clreg, self.post_clreg)
         self.backend = Aer.get_backend('qasm_simulator')
         
+        # for mitigation; deprecated by virtue of it being wrong
         if mit_matrices is None:
             self.mit_matrices = self.mit_matrices()
         else:
             self.mit_matrices = mit_matrices
             
         self.measured_bits = [-1]*(self.no_bits+self.max_no_swaps) # i'th member of list represents which qubit was
-        # measured into i'th classical bit (HERE 0'th bit is at the START); if -1, no qubit was measured into it. this is used for mitigation. 
+        # measured into i'th classical bit (HERE 0'th bit is at the START); if -1, no qubit was measured into it.
+        # this is used for mitigation. 
         
     def convert_coords(self, x_qubit,y_qubit):
+        # convert 2D coordinates of qubit into 1D qubit index
         return y_qubit * self.x + x_qubit
     
     def grid_coupling_map(self, x,y):
@@ -73,6 +103,12 @@ class GridCircuit:
         return coupling_map
     
     def gate(self, name, qubit1, qubit2 = None, parameters = None):
+        
+        # wraps gates in a function able to take in 2D coords
+        # but can take in qubit index as well
+        # e.g. gcirc.gate('rx', [0,1], parameters = 0.1) implements an rx gate by 0.1 rad
+        # on the qubit [0,1]
+        
         gates = {
             'cx' : self.circuit.cx,
             'rz' : self.circuit.rz,
@@ -114,24 +150,19 @@ class GridCircuit:
         return
     
     def measure(self, qubit, clbit):
+        # qiskit measurement wrapped in a function to accept 2D coords, and also
+        # to keep track of which qubit was measured in which bit;
+        # this was planned to be used for error mitigation purposes
         if type(qubit) is not int:
             qubit = self.convert_coords(qubit[0], qubit[1])
         self.circuit.measure(qubit, self.data_clreg[clbit])
         self.measured_bits[self.total_no_bits-1-clbit] = qubit # for mitigation
         return
-        
-    
-    def cnot(self, control, target):
-        # input: either ints, or list/array/tuple
-        if type(control) is int and type(target) is int:
-            self.circuit.cnot(control, target)
-        else:
-            control_qubit = self.convert_coords(control[0], control[1])
-            target_qubit = self.convert_coords(target[0], target[1])
-            self.circuit.cnot(control_qubit, target_qubit)
-        return
+
     
     def bswap(self, data_qubit, zero_qubit, postselect = True):
+        # performs the bubble swap and measures the qubit that previously had the data
+        # to postselect on whether it's found in |0>
         self.gate('cx', data_qubit, zero_qubit)
         self.gate('cx', zero_qubit, data_qubit)
         if postselect:
@@ -143,6 +174,8 @@ class GridCircuit:
         return
     
     def postselect(self, counts):
+        # postselects counts with bitstrings whose bits corresponding to 
+        # bubble swap measurements are all in 0
         res = {}
         for count in counts:
             if count[0:len(count)-self.no_bits] == '0'*(len(count)-self.no_bits):
@@ -151,8 +184,10 @@ class GridCircuit:
         return res
 
     def not_postselect(self, counts):
+        
+        # removes bits reserved for postselection from bitstrings
+        # i.e. "traces" over the postselection bits
         res = {}
-
         for count in counts:
             cut_count = count[len(count)-self.no_bits:]
             if cut_count in res:
@@ -162,7 +197,11 @@ class GridCircuit:
 
         return res
     
-    def run(self, shots, postselect = True, mitigate = True):
+    def run(self, shots, postselect = True, mitigate = True, probs = True):
+        
+        # central function for running a grid circuit, which executes the job
+        # corresponding to the circuit, calls mitigation and/or postselection functions
+        # and obtains probabilities from counts
         
         job = execute(self.circuit,
                       backend = self.backend,
@@ -174,16 +213,30 @@ class GridCircuit:
         
         counts = {}
         
+        # sometimes spaces appear between register, removing it to more easily keep track of
+        # indices
         for count in raw_counts:
             counts[count.replace(' ', '')] = raw_counts[count]
-            
+        
         if mitigate:
             counts = self.mitigate(counts)
             
         if postselect:
-            return self.postselect(counts)
+            counts = self.postselect(counts)
         else:
-            return self.not_postselect(counts)
+            counts = self.not_postselect(counts)
+        
+        # converting to probabilities
+        if probs:
+            total_counts = 0
+            probs = {}
+            for count in counts:
+                total_counts += counts[count]
+            for count in counts:
+                probs[count] = counts[count] / total_counts
+            return probs
+        else:
+            return counts
     
     def mit_matrices(self, shots = 10000):
         # creates list of inverted measurement calibration matrices for each qubit
@@ -230,32 +283,57 @@ class GridCircuit:
         
         return res
     
-    def mitigate(self, counts):
+    def remove_bitstrings(self, counts):
+        # find postselection bits which were measured into and only keep those bits
+        measured_bits_indices = []
+        new_measured_bits = []
+        for i in range(self.max_no_swaps):
+            qubit = self.measured_bits[i]
+            if qubit != -1:
+                measured_bits_indices.append(i)
+                new_measured_bits.append(qubit)
+        for i in range(self.max_no_swaps, self.total_no_bits):
+            qubit = self.measured_bits[i]
+            measured_bits_indices.append(i)
+            new_measured_bits.append(qubit)
+        self.measured_bits = new_measured_bits
+        res = {}
+        for count in counts:
+            new_count = ''
+            for index in measured_bits_indices:
+                new_count = new_count + count[index]
+            res[new_count] = counts[count]
         
+        return res
+                
+        
+        
+    def mitigate(self, counts):
+        # remove unused bits from bitstring, and correspondingly change measured_bits
+        new_counts = self.remove_bitstrings(counts)
         id_matrix = np.array([[1, 0], [0, 1]])
         M_inv = np.array([1])
-        for i in range(self.total_no_bits):
+        for qubit in self.measured_bits:
             # read through which qubit each classical bit corresponds to and tensor product with the right
             # inverse calibration matrix based on that
-            if self.measured_bits[i] == -1:
+            if qubit == -1:
                 M_inv = np.kron(M_inv, id_matrix)
             else:
-                M_inv = np.kron(M_inv, self.mit_matrices[self.measured_bits[i]])
-                
+                M_inv = np.kron(M_inv, self.mit_matrices[qubit])
         # create array out of unmitigated counts (vector to multiply the matrix with)
-        unmitigated_counts_array = np.zeros(2**self.total_no_bits)
-        for i in range(2**(self.total_no_bits)):
-            i_bin = format(i, '0'+str(self.total_no_bits)+'b')
-            if i_bin in counts:
-                unmitigated_counts_array[i] = counts[i_bin]
-        
-        #multiply matrix with vector to get mitigated counts
+        unmitigated_counts_array = np.zeros(2**len(self.measured_bits))
+        for i in range(len(unmitigated_counts_array)):
+            i_bin = format(i, '0'+str(len(self.measured_bits))+'b')
+            if i_bin in new_counts:
+                unmitigated_counts_array[i] = new_counts[i_bin]
+        print(unmitigated_counts_array)
+        # multiply matrix with vector to get mitigated counts
         mitigated_counts_array = np.matmul(M_inv, unmitigated_counts_array)
         
         #convert back to dictionary
         mitigated_counts_dict = {}
-        for i in range(2**(self.total_no_bits)):
-            i_bin = format(i, '0'+str(self.total_no_bits)+'b')
+        for i in range(len(unmitigated_counts_array)):
+            i_bin = format(i, '0'+str(len(self.measured_bits))+'b')
             mitigated_counts_dict[i_bin] = mitigated_counts_array[i]
         
         return mitigated_counts_dict
